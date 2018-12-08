@@ -201,25 +201,27 @@ impl Agent {
     fn poll_messages(&mut self) -> Result<(), Error> {
         loop {
             if !self.close_requested && self.requests.is_empty() {
-                match block_on(self.message_rx.next()) {
+                trace!("no active requests, going to sleep...");
+                let next = block_on(self.message_rx.next());
+                trace!("woke up from handle message!");
+
+                match next {
                     Some(message) => self.handle_message(message)?,
-                    _ => {
+                    None => {
                         warn!("agent handle disconnected without close message");
-                        // TODO
-                        // self.close_requested = true;
+                        self.close_requested = true;
                         break;
                     },
                 }
             } else {
                 match self.message_rx.try_next() {
                     Ok(Some(message)) => self.handle_message(message)?,
-                    Ok(None) => break,
-                    Err(_) => {
+                    Ok(None) => {
                         warn!("agent handle disconnected without close message");
-                        // TODO
-                        // self.close_requested = true;
+                        self.close_requested = true;
                         break;
                     },
+                    _ => break,
                 }
             }
         }
