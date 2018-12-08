@@ -7,7 +7,6 @@ use crate::internal::request;
 use crate::middleware::Middleware;
 use crate::options::*;
 use futures::executor;
-use futures::prelude::*;
 use http::{Request, Response};
 use lazy_static::lazy_static;
 use std::sync::Arc;
@@ -50,7 +49,7 @@ pub(crate) fn global() -> &'static Client {
 /// ```
 pub struct ClientBuilder {
     default_options: Options,
-    middleware: Vec<Box<dyn Middleware>>,
+    middleware: Vec<Box<dyn Middleware + 'static>>,
 }
 
 impl Default for ClientBuilder {
@@ -89,7 +88,7 @@ impl ClientBuilder {
     }
 
     #[allow(unused)]
-    fn with_middleware_impl(mut self, middleware: impl Middleware) -> Self {
+    fn with_middleware_impl(mut self, middleware: impl Middleware + 'static) -> Self {
         self.middleware.push(Box::new(middleware));
         self
     }
@@ -115,7 +114,7 @@ impl ClientBuilder {
 pub struct Client {
     agent: agent::Handle,
     default_options: Options,
-    middleware: Arc<Vec<Box<dyn Middleware>>>,
+    middleware: Arc<Vec<Box<dyn Middleware + 'static>>>,
 }
 
 impl Client {
@@ -148,7 +147,7 @@ impl Client {
     /// Sends an HTTP POST request.
     ///
     /// The response body is provided as a stream that may only be consumed once.
-    pub fn post<U>(&self, uri: U, body: impl Into<Body>) -> Result<Response<Body>, Error> where http::Uri: http::HttpTryFrom<U> {
+    pub fn post<U>(&self, uri: U, body: impl Into<Body> + 'static) -> Result<Response<Body>, Error> where http::Uri: http::HttpTryFrom<U> {
         let request = http::Request::post(uri).body(body)?;
         self.send(request)
     }
@@ -156,7 +155,7 @@ impl Client {
     /// Sends an HTTP PUT request.
     ///
     /// The response body is provided as a stream that may only be consumed once.
-    pub fn put<U>(&self, uri: U, body: impl Into<Body>) -> Result<Response<Body>, Error> where http::Uri: http::HttpTryFrom<U> {
+    pub fn put<U>(&self, uri: U, body: impl Into<Body> + 'static) -> Result<Response<Body>, Error> where http::Uri: http::HttpTryFrom<U> {
         let request = http::Request::put(uri).body(body)?;
         self.send(request)
     }
@@ -176,7 +175,7 @@ impl Client {
     /// instead of the default options this client is configured with.
     ///
     /// The response body is provided as a stream that may only be consumed once.
-    pub fn send<B: Into<Body>>(&self, request: Request<B>) -> Result<Response<Body>, Error> {
+    pub fn send<B: Into<Body> + 'static>(&self, request: Request<B>) -> Result<Response<Body>, Error> {
         executor::block_on(self.send_async_impl(request))
     }
 
@@ -188,11 +187,11 @@ impl Client {
     ///
     /// The response body is provided as a stream that may only be consumed once.
     #[cfg(feature = "async-api")]
-    pub fn send_async<B: Into<Body>>(&self, request: Request<B>) -> impl Future<Item=Response<Body>, Error=Error> {
-        self.send_async_impl(request)
+    pub async fn send_async<B: Into<Body>>(&self, request: Request<B>) -> Result<Response<Body>, Error> {
+        await!(self.send_async_impl(request))
     }
 
-    fn send_async_impl<B: Into<Body>>(&self, request: Request<B>) -> impl Future<Item=Response<Body>, Error=Error> {
+    async fn send_async_impl<B: Into<Body> + 'static>(&self, request: Request<B>) -> Result<Response<Body>, Error> {
         let mut request = request.map(Into::into);
 
         // Set default user agent if not specified.
@@ -214,21 +213,17 @@ impl Client {
         let options = request.extensions_mut().remove::<Options>();
         let options = options.as_ref().unwrap_or(&self.default_options);
 
-        return request::create(request, options)
-            .and_then(|(request, future)| {
-                self.agent.begin_execute(request).map(|_| future)
-            })
-            .into_future()
-            .flatten()
-            .map(move |mut response| {
-                response.extensions_mut().insert(uri);
+        let (request, future) = request::create(request, options)?;
+        self.agent.begin_execute(request)?;
 
-                // Apply response middleware, starting with the innermost one.
-                for middleware in middleware.iter() {
-                    response = middleware.filter_response(response);
-                }
+        let mut response = await!(future)?;
+        response.extensions_mut().insert(uri);
 
-                response
-            });
+        // Apply response middleware, starting with the innermost one.
+        for middleware in middleware.iter() {
+            response = middleware.filter_response(response);
+        }
+
+        Ok(response)
     }
 }

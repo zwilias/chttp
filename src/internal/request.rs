@@ -9,11 +9,12 @@ use curl::easy::InfoType;
 use futures::channel::oneshot;
 use futures::executor;
 use futures::prelude::*;
+use futures::task::AtomicWaker;
+use futures::task::Poll;
 use http::{Request, Response};
 use lazycell::AtomicLazyCell;
 use log::*;
 use std::io::{self, Read};
-use std::mem;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::*;
 
@@ -21,7 +22,7 @@ const STATUS_READY: usize = 0;
 const STATUS_CLOSED: usize = 1;
 
 /// Create a new curl request.
-pub fn create<B: Into<Body>>(request: Request<B>, options: &Options) -> Result<(CurlRequest, impl Future<Item=Response<Body>, Error=Error>), Error> {
+pub fn create<B: Into<Body>>(request: Request<B>, options: &Options) -> Result<(CurlRequest, impl Future<Output=Result<Response<Body>, Error>>), Error> {
     // Set up the plumbing...
     let (future_tx, future_rx) = oneshot::channel();
     let (request_parts, request_body) = request.into_parts();
@@ -110,14 +111,14 @@ pub fn create<B: Into<Body>>(request: Request<B>, options: &Options) -> Result<(
         }
     }
 
-    let future_rx = future_rx.then(|result| match result {
-        Ok(Ok(response)) => Ok(response),
+    let future_rx = future_rx.map(|result| match result {
+        Ok(Ok(response)) => Ok(response.map(Body::from_reader)),
         Ok(Err(e)) => Err(e),
         Err(oneshot::Canceled) => {
             error!("request canceled by agent; this should never happen!");
             Err(Error::Canceled)
         },
-    }).map(|response| response.map(Body::from_reader));
+    });
 
     Ok((CurlRequest(easy), future_rx))
 }
@@ -339,37 +340,29 @@ pub struct CurlResponseStream {
 // Synchronous wrapper around async stream.
 impl io::Read for CurlResponseStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        executor::block_on(AsyncReadExt::read(self, buf).map(|r| r.2))
+        executor::block_on(AsyncReadExt::read(self, buf))
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        executor::block_on(AsyncReadExt::read_exact(self, buf).map(|_| ()))
+        executor::block_on(AsyncReadExt::read_exact(self, buf))
     }
 
     fn read_to_end(&mut self, dest: &mut Vec<u8>) -> io::Result<usize> {
-        let mut buf = Vec::new();
-        mem::swap(&mut buf, dest);
-
-        match executor::block_on(AsyncReadExt::read_to_end(self, buf)) {
-            Ok((_, buf)) => {
-                *dest = buf;
-                Ok(dest.len())
-            },
-            Err(e) => Err(e),
-        }
+        executor::block_on(AsyncReadExt::read_to_end(self, dest))?;
+        Ok(dest.len())
     }
 }
 
 impl AsyncRead for CurlResponseStream {
-    fn poll_read(&mut self, cx: &mut task::Context, dest: &mut [u8]) -> Result<Async<usize>, io::Error> {
+    fn poll_read(&mut self, w: &futures::task::LocalWaker, dest: &mut [u8]) -> Poll<Result<usize, io::Error>> {
         trace!("received read request for {} bytes", dest.len());
 
         if dest.is_empty() {
-            return Ok(Async::Ready(0));
+            return Poll::Ready(Ok(0));
         }
 
         // Set the current read waker.
-        self.state.read_waker.register(cx.waker());
+        self.state.read_waker.register(w);
 
         // Attempt to read some from the buffer.
         let mut buffer = self.state.buffer.lock().unwrap();
@@ -377,7 +370,7 @@ impl AsyncRead for CurlResponseStream {
         // If the request failed, return an error.
         if let Some(error) = self.state.error.borrow() {
             debug!("failing read due to error: {:?}", error);
-            return Err(error.clone().into());
+            return Poll::Ready(Err(error.clone().into()));
         }
 
         // If data is available, read some.
@@ -388,13 +381,13 @@ impl AsyncRead for CurlResponseStream {
             let consumed = buffer.split_to(amount_to_consume);
             (&mut dest[0..amount_to_consume]).copy_from_slice(&consumed);
 
-            return Ok(Async::Ready(consumed.len()));
+            return Poll::Ready(Ok(consumed.len()));
         }
 
         // If the request is closed, return EOF.
         if self.state.is_closed() {
             trace!("request is closed, satisfying read request with EOF");
-            return Ok(Async::Ready(0));
+            return Poll::Ready(Ok(0));
         }
 
         // Before we yield, ensure the request is not paused so that the buffer may be filled with new data.
@@ -405,7 +398,7 @@ impl AsyncRead for CurlResponseStream {
         }
 
         trace!("buffer is empty, read is pending");
-        Ok(Async::Pending)
+        Poll::Pending
     }
 }
 
@@ -418,7 +411,7 @@ struct RequestState {
     token: AtomicLazyCell<usize>,
     error: AtomicLazyCell<curl::Error>,
     buffer: Mutex<Bytes>,
-    read_waker: task::AtomicWaker,
+    read_waker: AtomicWaker,
 }
 
 impl RequestState {
@@ -430,7 +423,7 @@ impl RequestState {
             token: AtomicLazyCell::new(),
             error: AtomicLazyCell::new(),
             buffer: Mutex::new(Bytes::new()),
-            read_waker: task::AtomicWaker::default(),
+            read_waker: AtomicWaker::default(),
         }
     }
 

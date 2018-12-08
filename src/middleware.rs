@@ -47,7 +47,7 @@ pub fn create(
 ///
 /// Since clients may be used to send requests concurrently, all middleware must be synchronized and must be able to
 /// account for multiple requests being made in parallel.
-pub trait Middleware: Send + Sync + 'static {
+pub trait Middleware: Send + Sync {
     /// Transform a request before it is sent.
     fn filter_request(&self, request: Request) -> Request {
         request

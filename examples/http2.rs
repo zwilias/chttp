@@ -1,5 +1,3 @@
-extern crate chttp;
-
 fn main() {
     let response = chttp::http::Request::get("https://nghttp2.org")
         .extension(chttp::Options::default()

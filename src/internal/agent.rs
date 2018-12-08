@@ -3,7 +3,8 @@
 use crate::error::Error;
 use crate::internal::notify;
 use crate::internal::request::*;
-use crossbeam_channel::{self, Sender, Receiver};
+use futures::executor::block_on;
+use futures::stream::StreamExt;
 use log::*;
 use slab::Slab;
 use std::sync::{Arc, Weak};
@@ -19,7 +20,7 @@ const MAX_TIMEOUT: Duration = Duration::from_millis(1000);
 ///
 /// The agent maintains a background thread that multiplexes all active requests using a single "multi" handle.
 pub fn create() -> Result<Handle, Error> {
-    let (message_tx, message_rx) = crossbeam_channel::unbounded();
+    let (message_tx, message_rx) = futures::channel::mpsc::unbounded();
     let (notify_tx, notify_rx) = notify::create()?;
 
     let handle_inner = Arc::new(HandleInner {
@@ -58,7 +59,7 @@ pub struct Handle {
 #[derive(Debug)]
 struct HandleInner {
     /// Used to send messages to the agent.
-    message_tx: Sender<Message>,
+    message_tx: futures::channel::mpsc::UnboundedSender<Message>,
 
     /// Used to wake up the agent thread while it is polling.
     notify_tx: notify::NotifySender,
@@ -96,7 +97,7 @@ impl HandleInner {
             return Err(Error::Internal);
         }
 
-        self.message_tx.send(message).map_err(|_| Error::Internal)?;
+        self.message_tx.unbounded_send(message).map_err(|_| Error::Internal)?;
         self.notify_tx.notify();
 
         Ok(())
@@ -124,7 +125,7 @@ struct Agent {
     multi: curl::multi::Multi,
 
     /// Incoming message from the main thread.
-    message_rx: Receiver<Message>,
+    message_rx: futures::channel::mpsc::UnboundedReceiver<Message>,
 
     /// Used to wake up the agent when polling.
     notify_rx: notify::NotifyReceiver,
@@ -200,21 +201,23 @@ impl Agent {
     fn poll_messages(&mut self) -> Result<(), Error> {
         loop {
             if !self.close_requested && self.requests.is_empty() {
-                match self.message_rx.recv() {
-                    Ok(message) => self.handle_message(message)?,
+                match block_on(self.message_rx.next()) {
+                    Some(message) => self.handle_message(message)?,
                     _ => {
                         warn!("agent handle disconnected without close message");
-                        self.close_requested = true;
+                        // TODO
+                        // self.close_requested = true;
                         break;
                     },
                 }
             } else {
-                match self.message_rx.try_recv() {
-                    Ok(message) => self.handle_message(message)?,
-                    Err(crossbeam_channel::TryRecvError::Empty) => break,
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                match self.message_rx.try_next() {
+                    Ok(Some(message)) => self.handle_message(message)?,
+                    Ok(None) => break,
+                    Err(_) => {
                         warn!("agent handle disconnected without close message");
-                        self.close_requested = true;
+                        // TODO
+                        // self.close_requested = true;
                         break;
                     },
                 }
