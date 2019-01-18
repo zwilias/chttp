@@ -30,6 +30,7 @@ http = "0.1"
 lazy_static = "1"
 lazycell = "1.2"
 log = "0.4"
+mio = "0.6"
 regex = "1.1"
 slab = "0.4"
 withers_derive = "0.2"
@@ -45,9 +46,6 @@ optional = true
 [dependencies.psl]
 version = "0.4"
 optional = true
-
-[target.'cfg(unix)'.dependencies]
-nix = "0.13"
 
 [dev-dependencies]
 env_logger = "0.6"

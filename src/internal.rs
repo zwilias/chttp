@@ -1,7 +1,6 @@
 use std::ascii;
 
 pub mod agent;
-pub mod notify;
 pub mod parse;
 pub mod request;
 

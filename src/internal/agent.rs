@@ -1,10 +1,11 @@
 //! Curl agent that executes multiple requests simultaneously.
 
 use crate::error::Error;
-use crate::internal::notify;
 use crate::internal::request::*;
 use crossbeam_channel::{self, Sender, Receiver};
+use curl::multi;
 use log::*;
+use mio::*;
 use slab::Slab;
 use std::sync::{Arc, Weak};
 use std::sync::atomic::*;
@@ -14,6 +15,13 @@ use std::time::{Duration, Instant};
 const AGENT_THREAD_NAME: &'static str = "curl agent";
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_TIMEOUT: Duration = Duration::from_millis(1000);
+const WAKER_TOKEN: Token = Token(usize::max_value() - 1);
+
+/// Handle to an agent. Handles can be sent between threads, shared, and cloned.
+#[derive(Clone, Debug)]
+pub struct Handle {
+    inner: Arc<HandleInner>,
+}
 
 /// Create an agent that executes multiple curl requests simultaneously.
 ///
@@ -22,24 +30,18 @@ pub fn create() -> Result<Handle, Error> {
     let create_start = Instant::now();
 
     let (message_tx, message_rx) = crossbeam_channel::unbounded();
-    let (notify_tx, notify_rx) = notify::create()?;
+    let (notify_rx, waker) = mio::Registration::new2();
 
     let handle_inner = Arc::new(HandleInner {
         message_tx,
-        notify_tx,
+        waker,
         thread_terminated: AtomicBool::default(),
     });
+
     let handle_weak = Arc::downgrade(&handle_inner);
 
     thread::Builder::new().name(String::from(AGENT_THREAD_NAME)).spawn(move || {
-        let agent = Agent {
-            multi: curl::multi::Multi::new(),
-            message_rx,
-            notify_rx,
-            requests: Slab::new(),
-            close_requested: false,
-            handle: handle_weak,
-        };
+        let agent = Agent::new(message_rx, notify_rx, handle_weak).unwrap();
 
         debug!("agent took {:?} to start up", create_start.elapsed());
 
@@ -52,12 +54,6 @@ pub fn create() -> Result<Handle, Error> {
     })
 }
 
-/// Handle to an agent. Handles can be sent between threads, shared, and cloned.
-#[derive(Clone, Debug)]
-pub struct Handle {
-    inner: Arc<HandleInner>,
-}
-
 /// Actual handle to an agent. Only one of these exists per agent.
 #[derive(Debug)]
 struct HandleInner {
@@ -65,7 +61,7 @@ struct HandleInner {
     message_tx: Sender<Message>,
 
     /// Used to wake up the agent thread while it is polling.
-    notify_tx: notify::NotifySender,
+    waker: SetReadiness,
 
     /// Indicates that the agent thread has exited.
     thread_terminated: AtomicBool,
@@ -101,7 +97,7 @@ impl HandleInner {
         }
 
         self.message_tx.send(message).map_err(|_| Error::Internal)?;
-        self.notify_tx.notify();
+        self.waker.set_readiness(mio::Ready::readable())?;
 
         Ok(())
     }
@@ -127,16 +123,24 @@ enum Message {
 /// Internal state of the agent thread.
 struct Agent {
     /// A curl multi handle, of course.
-    multi: curl::multi::Multi,
+    multi: multi::Multi,
+
+    /// A poll
+    poll: Poll,
 
     /// Incoming message from the main thread.
     message_rx: Receiver<Message>,
 
-    /// Used to wake up the agent when polling.
-    notify_rx: notify::NotifyReceiver,
+    /// A queue of requests from curl to register or unregister sockets.
+    socket_changes: Receiver<(multi::Socket, multi::SocketEvents, usize)>,
+
+    /// The evented handle that the agent handle uses to wake up the agent loop.
+    /// We don't really use it for much, we just carry it along so it doesn't
+    /// get dropped until shutdown.
+    waker: Registration,
 
     /// Contains all of the active requests.
-    requests: Slab<curl::multi::Easy2Handle<CurlHandler>>,
+    requests: Slab<multi::Easy2Handle<CurlHandler>>,
 
     /// Indicates if the thread has been requested to stop.
     close_requested: bool,
@@ -146,16 +150,74 @@ struct Agent {
 }
 
 impl Agent {
+    fn new(message_rx: Receiver<Message>, waker: Registration, handle: Weak<HandleInner>) -> Result<Self, Error> {
+        let poll = Poll::new()?;
+        poll.register(&waker, WAKER_TOKEN, Ready::all(), PollOpt::edge())?;
+
+        let mut multi = multi::Multi::new();
+        let (socket_tx, socket_rx) = crossbeam_channel::unbounded();
+
+        multi.socket_function(move |socket, events, token| {
+            debug_assert!(socket_tx.send((socket, events, token)).is_ok());
+        })?;
+
+
+        Ok(Self {
+            multi,
+            poll,
+            message_rx,
+            socket_changes: socket_rx,
+            waker,
+            requests: Slab::new(),
+            close_requested: false,
+            handle: handle,
+        })
+    }
+
     /// Run the agent in the current thread until requested to stop.
     fn run(mut self) -> Result<(), Error> {
-        let mut wait_fds = [self.notify_rx.as_wait_fd()];
-        wait_fds[0].poll_on_read(true);
+        let mut events = Events::with_capacity(1024);
+        let mut sockets = Slab::new();
 
         debug!("agent ready");
 
         // Agent main loop.
         loop {
             self.poll_messages()?;
+
+            // Handle any socket changes from curl.
+            for (socket, events, mut token) in self.socket_changes.try_iter() {
+                // Brand new socket.
+                if token == 0 {
+                    token = sockets.insert(socket);
+                    self.multi.assign(socket, token)?;
+
+                    let readiness = match (events.input(), events.output()) {
+                        (true, true) => Ready::all(),
+                        (true, false) => Ready::readable(),
+                        (false, true) => Ready::writable(),
+                        (false, false) => Ready::empty(),
+                    };
+
+                    self.poll.register(&mio::unix::EventedFd(&socket), Token(token), readiness, PollOpt::level())?;
+                }
+
+                else if events.remove() {
+                    self.poll.deregister(&mio::unix::EventedFd(&socket))?;
+                    sockets.remove(token);
+                }
+
+                else {
+                    let readiness = match (events.input(), events.output()) {
+                        (true, true) => Ready::all(),
+                        (true, false) => Ready::readable(),
+                        (false, true) => Ready::writable(),
+                        (false, false) => Ready::empty(),
+                    };
+
+                    self.poll.reregister(&mio::unix::EventedFd(&socket), Token(token), readiness, PollOpt::level())?;
+                }
+            }
 
             // Perform any pending reads or writes and handle any state changes.
             self.dispatch()?;
@@ -183,12 +245,24 @@ impl Agent {
             // Block until activity is detected or the timeout passes.
             if timeout > Duration::from_secs(0) {
                 trace!("polling with timeout of {:?}", timeout);
-                self.multi.wait(&mut wait_fds, timeout)?;
+
+                self.poll.poll(&mut events, Some(timeout))?;
             }
 
-            // We might have woken up early from the notify fd, so drain its queue.
-            if self.notify_rx.drain() {
-                trace!("woke up from notify fd");
+            // Handle any readiness events.
+            for event in &events {
+                // Skip spurious events.
+                if event.readiness().is_empty() {
+                    if event.token() == WAKER_TOKEN {
+                        debug!("woke up by agent handle");
+                    } else {
+                        let socket = sockets[event.token().0];
+
+                        self.multi.action(socket, multi::Events::new()
+                            .input(event.readiness().is_readable())
+                            .output(event.readiness().is_writable()))?;
+                    }
+                }
             }
         }
 
