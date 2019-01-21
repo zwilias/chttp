@@ -243,24 +243,25 @@ impl Agent {
             timeout = timeout.min(MAX_TIMEOUT);
 
             // Block until activity is detected or the timeout passes.
-            if timeout > Duration::from_secs(0) {
-                trace!("polling with timeout of {:?}", timeout);
+            trace!("polling with timeout of {:?}", timeout);
 
-                self.poll.poll(&mut events, Some(timeout))?;
-            }
+            if self.poll.poll(&mut events, Some(timeout))? == 0 {
+                // Reached timeout, let curl know.
+                self.multi.timeout()?;
+            } else {
+                // Handle any readiness events.
+                for event in &events {
+                    // Skip spurious events.
+                    if event.readiness().is_empty() {
+                        if event.token() == WAKER_TOKEN {
+                            debug!("woke up by agent handle");
+                        } else {
+                            let socket = sockets[event.token().0];
 
-            // Handle any readiness events.
-            for event in &events {
-                // Skip spurious events.
-                if event.readiness().is_empty() {
-                    if event.token() == WAKER_TOKEN {
-                        debug!("woke up by agent handle");
-                    } else {
-                        let socket = sockets[event.token().0];
-
-                        self.multi.action(socket, multi::Events::new()
-                            .input(event.readiness().is_readable())
-                            .output(event.readiness().is_writable()))?;
+                            self.multi.action(socket, multi::Events::new()
+                                .input(event.readiness().is_readable())
+                                .output(event.readiness().is_writable()))?;
+                        }
                     }
                 }
             }
