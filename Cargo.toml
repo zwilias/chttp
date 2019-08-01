@@ -27,6 +27,7 @@ spnego = ["curl-sys/spnego"]
 static-curl = ["curl/static-curl"]
 text-decoding = ["encoding_rs", "mime"]
 middleware-api-preview = []
+static-ssl = ["curl/static-ssl", "curl/force-system-lib-on-osx"]
 
 [dependencies]
 bytes = "0.5"
